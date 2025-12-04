@@ -28,8 +28,8 @@ def main(cfg: OmegaConf):
     OmegaConf.resolve(cfg)
 
     cls = hydra.utils.get_class(cfg._target_)
-    workspace: BaseWorkspace = cls(cfg)
-    workspace.run()
+    workspace: BaseWorkspace = cls(cfg) # 实例化Workspace类
+    workspace.run() # 加载数据集、模型、优化器等资源, 配置训练组件, 初始化WandB, 迁移模型到GPU, 开始训练循环
 
 if __name__ == "__main__":
     main()
