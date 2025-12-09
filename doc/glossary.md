@@ -2,22 +2,23 @@
 
 | 术语 | 中文/含义 | 说明 |
 |------|-----------|------|
+| (global) step | 步数 | 模型参数更新的次数，等于处理过的 batch 数；global_step 跨 epoch 递增，用于记录进度。 |
 | batch | 批次 | 一次送入模型训练的样本集合，batch size=64 表示每一步用 64 条数据计算梯度后更新参数。 |
+| checkpoint | 检查点 | 保存当前模型/优化器状态的文件，用于断点续训或回溯最佳模型。 |
+| ckpt | checkpoint 文件 | 训练过程中的模型权重和优化器状态文件，常见扩展名为 .ckpt。可用于恢复模型、继续训练或推理。 |
+| dataloader | 数据加载器 | 分批读取/预处理数据的工具，可用多进程 (num_workers) 加速。 |
+| EMA | 指数滑动平均 | 维护一份平滑的模型权重副本，推理/评估时更稳定。 |
 | epoch | 轮次 | 将整个训练数据完整遍历一遍称为 1 个 epoch，训练多轮让模型多次“看”到全部数据。 |
 | episode | 回合/轨迹 | 在强化/模仿学习里，从环境 reset 到终止的一条完整交互，如机器人演示轨迹。 |
-| (global) step | 步数 | 模型参数更新的次数，等于处理过的 batch 数；global_step 跨 epoch 递增，用于记录进度。 |
 | loss | 损失函数 | 衡量预测与真实差距的指标，训练目标是让 loss 尽量变小。 |
-| MSE | 均方误差 | 常见的回归/动作预测损失：$(\hat{y}-y)^2$ 的平均值，越小说明预测越准。 |
 | lr / learning rate | 学习率 | 决定梯度更新步长的超参，太大易震荡，太小收敛慢。 |
-| optimizer | 优化器 | 计算并应用梯度的算法，如 SGD、Adam、AdamW，帮助参数更快收敛。 |
-| dataloader | 数据加载器 | 分批读取/预处理数据的工具，可用多进程 (num_workers) 加速。 |
-| checkpoint | 检查点 | 保存当前模型/优化器状态的文件，用于断点续训或回溯最佳模型。 |
-| rollout | 环境评测 | 将当前策略放进环境跑几次，收集成功率、奖励、视频等指标。 |
-| validation (val) | 验证集评估 | 在独立数据上测 loss/性能，避免只在训练集上拟合。 |
-| train_action_mse_error | 动作 MSE 误差 | Diffusion Policy 中衡量预测动作与真实动作之间的均方误差。 |
-| mean_score / success rate | 平均得分 | rollouts 的平均成功率或奖励，是最终效果的重要指标。 |
 | lr scheduler | 学习率调度器 | 动态调整学习率（如 warmup+cosine），让训练更平稳。 |
-| EMA | 指数滑动平均 | 维护一份平滑的模型权重副本，推理/评估时更稳定。 |
-| payload | 载荷/状态字典 | 保存/恢复训练状态时使用的字典结构，包含模型参数、优化器状态、进度等信息。 |
-| ckpt | checkpoint 文件 | 训练过程中的模型权重和优化器状态文件，常见扩展名为 .ckpt。可用于恢复模型、继续训练或推理。 |
+| mean_score / success rate | 平均得分 | rollouts 的平均成功率或奖励，是最终效果的重要指标。 |
+| MSE | 均方误差 | 常见的回归/动作预测损失：$(\hat{y}-y)^2$ 的平均值，越小说明预测越准。 |
 | optimizer | 优化器 | 计算并应用梯度的算法，如 SGD、Adam、AdamW，帮助参数更快收敛。 |
+| optimizer | 优化器 | 计算并应用梯度的算法，如 SGD、Adam、AdamW，帮助参数更快收敛。 |
+| payload | 载荷/状态字典 | 保存/恢复训练状态时使用的字典结构，包含模型参数、优化器状态、进度等信息。 |
+| rollout | 环境评测 | 将当前策略放进环境跑几次，收集成功率、奖励、视频等指标。 |
+| shuffle | 洗牌、打乱 | 在 dataloader 中 shuffle=True 表示每轮对数据顺序随机打乱，提升训练泛化能力。 |
+| train_action_mse_error | 动作 MSE 误差 | Diffusion Policy 中衡量预测动作与真实动作之间的均方误差。 |
+| validation (val) | 验证集评估 | 在独立数据上测 loss/性能，避免只在训练集上拟合。 |
