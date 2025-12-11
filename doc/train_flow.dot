@@ -1,0 +1,44 @@
+digraph G {
+  rankdir=TB;
+  node [shape=box, style=rounded, fontsize=11];
+
+  subgraph cluster_train {
+    label="4.2.1 训练阶段";
+    style=rounded;
+    A[label="开始 epoch"];
+    B[label="遍历 train_dataloader\nbatch_idx, batch in tepoch"];
+    C[label="步骤1: 数据迁移到GPU\nbatch -> device"];
+    D[label="步骤2: 前向计算 raw_loss\nloss = raw_loss / accumulate_every"];
+    E[label="步骤3: 反向传播\nloss.backward()"];
+    F[label="global_step % accumulate_every == 0?"];
+    G[label="步骤4: 优化器更新\noptimizer.step()\noptimizer.zero_grad()\nlr_scheduler.step()"];
+    H[label="跳过优化器更新"];
+    I[label="EMA ?"];
+    J[label="步骤5: ema.step(model)"];
+    K[label="跳过 EMA"];
+    L[label="步骤6: 记录日志\nloss/step/epoch/lr\nwandb_run.log / json_logger"];
+    M[label="global_step += 1"];
+
+    A->B->C->D->E->F;
+    F->G[label="是"]; F->H[label="否"];
+    G->I; H->I;
+    I->J[label="是"]; I->K[label="否"];
+    J->L; K->L;
+    L->M->B [label="下一 batch 或结束", style=dashed];
+  }
+
+  subgraph cluster_loss {
+    label="compute_loss(batch)";
+    style=rounded;
+    C1[label="1. 归一化观测与动作\nnobs = normalizer(obs)\nnaction = normalizer['action'](action)"];
+    C2[label="2. 编码观测特征\nobs_features = obs_encoder(nobs)"];
+    C3[label="3. 随机时间步 t\nUniform[0, T-1], 形状 (B,)"];
+    C4[label="4. 前向加噪\nnoise ~ N(0,1)\nnoisy_actions = add_noise(naction, noise, t)"];
+    C5[label="5. 反向去噪预测\nnoise_pred = model(noisy_actions, t,\n  global_cond=obs_features)"];
+    C6[label="6. 损失\nloss = MSE(noise_pred, noise)"];
+
+    C1->C2->C3->C4->C5->C6;
+  }
+
+  D->C1 [style=dashed, label="调用 compute_loss"];
+}

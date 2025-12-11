@@ -580,6 +580,7 @@ def main():
     parser.add_argument(
         '--play', 
         action='store_true',
+        default=True,
         help='在窗口中播放而不是保存为GIF（支持暂停、翻帧等交互）'
     )
     parser.add_argument(
@@ -627,7 +628,7 @@ def main():
             indices = random.sample(range(total_episodes), min(args.num_samples, total_episodes))
         else:
             indices = list(range(min(args.num_samples, total_episodes)))
-        
+        indices = [123,111,202]
         print(f"将可视化 {len(indices)} 个完整 episodes: {indices}")
         
         # 可视化每个 episode

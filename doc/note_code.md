@@ -36,3 +36,68 @@
 
 - **一句话总结**：  
   **优化器决定“怎么走”（用什么公式更新参数），LR Scheduler 决定“每一步走多大”（学习率随时间怎么变）。**
+
+# Step、Episode、Batch、Epoch 的关系
+
+### 基本定义
+
+1. **Episode（回合/轨迹）**
+   - 一条完整的专家演示轨迹
+   - 例如：机器人从起点到完成任务的完整过程
+   - 你的数据：206 个 episodes
+
+2. **Batch（批次）**
+   - 一次送入模型的数据量
+   - `batch_size = 64`：每次处理 64 个样本
+   - 每个 batch 包含多个 episode 的片段
+
+3. **Step（步数）**
+   - 处理一个 batch 并更新一次参数 = 1 step
+   - `global_step`：跨 epoch 累计的总步数
+   - 每个 epoch 有 168 个 steps（168 个 batches）
+
+4. **Epoch（轮次）**
+   - 完整遍历一次训练集 = 1 epoch
+   - 你的配置：3050 个 epochs
+
+### 层级关系
+
+```
+Episode（206个）
+    ↓ 切分成片段
+Batch（每个epoch 168个，每个batch包含64个样本）
+    ↓ 逐个处理
+Step（每个batch = 1 step，每个epoch = 168 steps）
+    ↓ 累积
+Epoch（3050个）
+```
+
+### 数量关系（你的项目）
+
+```
+1 Epoch = 168 Batches = 168 Steps
+1 Batch = 64 个样本（来自不同episodes的片段）
+总 Steps = 168 × 3050 = 512,400 steps
+总 Episodes = 206 个（原始数据）
+```
+
+### 训练流程示例
+
+```python
+for epoch in range(3050):           # 3050个epoch
+    for batch in train_dataloader:  # 每个epoch 168个batch
+        # 处理1个batch = 1个step
+        loss = model(batch)          # batch包含64个样本
+        loss.backward()
+        optimizer.step()             # 更新参数
+        global_step += 1             # step计数+1
+```
+
+### 记忆口诀
+
+- **Episode**：原始数据单位（一条完整轨迹）
+- **Batch**：训练单位（一次处理的数据量）
+- **Step**：更新单位（处理一个 batch = 1 step）
+- **Epoch**：遍历单位（完整过一遍数据 = 1 epoch）
+
+**关系**：多个 Episodes → 切分成 Batches → 每个 Batch 产生 1 Step → 多个 Steps 组成 1 Epoch
