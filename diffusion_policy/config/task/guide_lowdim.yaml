@@ -1,0 +1,31 @@
+name: guide_lowdim
+
+obs_dim: 4  # robot (2) + human (2)
+action_dim: 2  # delta x, delta y
+keypoint_dim: 2  # same as action_dim for compatibility
+
+dataset:
+  _target_: diffusion_policy.dataset.guide_lowdim_dataset.GuideLowdimDataset
+  data_dir: /home/yyf/IROS2026/FollowDataset/data  # Can be overridden via: task.dataset.data_dir=/path/to/data
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  action_mode: delta  # delta, position, or velocity
+
+env_runner:
+  _target_: diffusion_policy.env_runner.guide_lowdim_runner.GuideLowdimRunner
+  data_dir: ${task.dataset.data_dir}
+  n_test: 50
+  n_test_vis: 4
+  test_start_seed: 100000
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  val_ratio: ${task.dataset.val_ratio}
+  action_mode: ${task.dataset.action_mode}
+  tqdm_interval_sec: 5.0
