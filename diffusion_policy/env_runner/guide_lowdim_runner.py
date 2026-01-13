@@ -181,12 +181,12 @@ class GuideLowdimRunner(BaseLowdimRunner):
             for ep_idx in pbar:
                 # Get episode data
                 episode = replay_buffer.get_episode(ep_idx)
-                obs_episode = episode['obs']  # (T, 4) - [robot, human]
+                obs_episode = episode['obs']  # (T, D) - [robot, human, lookahead...]
                 action_episode = episode['action']  # (T, 2)
                 
                 # Extract robot and human trajectories
                 robot_traj = obs_episode[:, :2]  # (T, 2)
-                human_traj = obs_episode[:, 2:]  # (T, 2)
+                human_traj = obs_episode[:, 2:4]  # (T, 2)
                 
                 # Evaluate on sliding windows
                 episode_errors = []

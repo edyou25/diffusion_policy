@@ -1,5 +1,6 @@
 from typing import Dict, Optional
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -26,12 +27,16 @@ class GuideLowdimDataset(BaseLowdimDataset):
         val_ratio: float = 0.0,
         max_train_episodes: Optional[int] = None,
         action_mode: str = "delta",
+        n_lookahead: int = 10,
+        lookahead_stride: int = 1,
     ):
         super().__init__()
 
         self.data_dir = Path(data_dir)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"data_dir not found: {self.data_dir}")
+        self.n_lookahead = max(0, int(n_lookahead))
+        self.lookahead_stride = max(1, int(lookahead_stride))
 
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
         episode_dirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
@@ -96,9 +101,71 @@ class GuideLowdimDataset(BaseLowdimDataset):
         robot = robot[:length]
         human = human[:length]
 
-        obs = np.concatenate([robot, human], axis=-1).astype(np.float32)
+        ref_path = self._load_reference_path(traj_path)
+        headings = self._compute_headings(robot)
+        ref_features = self._build_reference_features(robot, headings, ref_path)
+
+        obs = np.concatenate([robot, human, ref_features], axis=-1).astype(np.float32)
         action = self._build_action(robot, root, length, action_mode)
         return {"obs": obs, "action": action}
+
+    def _load_reference_path(self, traj_path: Path) -> Optional[np.ndarray]:
+        meta_path = traj_path.parent / "metadata.json"
+        if not meta_path.exists():
+            print(f"[warn] metadata.json not found for {traj_path}")
+            return None
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception as exc:
+            print(f"[warn] failed to load metadata {meta_path}: {exc}")
+            return None
+        ref = np.asarray(meta.get("reference_path", []), dtype=np.float32)
+        if ref.ndim != 2 or ref.shape[1] != 2:
+            print(f"[warn] invalid reference_path in {meta_path}")
+            return None
+        return ref
+
+    def _compute_headings(self, robot: np.ndarray) -> np.ndarray:
+        if len(robot) < 2:
+            return np.zeros((len(robot),), dtype=np.float32)
+        diffs = np.diff(robot, axis=0)
+        headings = np.zeros((len(robot),), dtype=np.float32)
+        headings[:-1] = np.arctan2(diffs[:, 1], diffs[:, 0]).astype(np.float32)
+        headings[-1] = headings[-2]
+        for i in range(1, len(robot)):
+            if np.linalg.norm(diffs[i - 1]) < 1e-6:
+                headings[i] = headings[i - 1]
+        return headings
+
+    def _build_reference_features(
+        self,
+        robot: np.ndarray,
+        headings: np.ndarray,
+        ref_path: Optional[np.ndarray],
+    ) -> np.ndarray:
+        length = len(robot)
+        if self.n_lookahead <= 0:
+            return np.zeros((length, 0), dtype=np.float32)
+        if ref_path is None or len(ref_path) == 0:
+            return np.zeros((length, self.n_lookahead * 2), dtype=np.float32)
+
+        ref_path = ref_path.astype(np.float32)
+        n_ref = len(ref_path)
+        features = np.zeros((length, self.n_lookahead, 2), dtype=np.float32)
+        for t in range(length):
+            pos = robot[t]
+            diffs = ref_path - pos
+            idx = int(np.argmin(np.sum(diffs * diffs, axis=1)))
+            indices = idx + np.arange(self.n_lookahead) * self.lookahead_stride
+            indices = np.clip(indices, 0, n_ref - 1)
+            points = ref_path[indices]
+            rel = points - pos
+            cos_h = float(np.cos(headings[t]))
+            sin_h = float(np.sin(headings[t]))
+            features[t, :, 0] = cos_h * rel[:, 0] + sin_h * rel[:, 1]
+            features[t, :, 1] = -sin_h * rel[:, 0] + cos_h * rel[:, 1]
+        return features.reshape(length, -1)
 
     def _build_action(
         self,

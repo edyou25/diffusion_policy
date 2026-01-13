@@ -1,8 +1,10 @@
 name: guide_lowdim
 
-obs_dim: 4  # robot (2) + human (2)
+n_lookahead: 10
+lookahead_stride: 1
+obs_dim: ${eval:'4 + 2*${task.n_lookahead}'}  # robot(2) + human(2) + lookahead
 action_dim: 2  # delta x, delta y
-keypoint_dim: 2  # same as action_dim for compatibility
+keypoint_dim: 0
 
 dataset:
   _target_: diffusion_policy.dataset.guide_lowdim_dataset.GuideLowdimDataset
@@ -14,6 +16,8 @@ dataset:
   val_ratio: 0.05
   max_train_episodes: null
   action_mode: delta  # delta, position, or velocity
+  n_lookahead: ${task.n_lookahead}
+  lookahead_stride: ${task.lookahead_stride}
 
 env_runner:
   _target_: diffusion_policy.env_runner.guide_lowdim_runner.GuideLowdimRunner
