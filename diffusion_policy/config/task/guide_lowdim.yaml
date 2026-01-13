@@ -1,7 +1,8 @@
 name: guide_lowdim
 
 n_lookahead: 10
-lookahead_stride: 1
+k_lookahead: 5
+frame_stride: 5
 obs_dim: ${eval:'4 + 2*${task.n_lookahead}'}  # robot(2) + human(2) + lookahead
 action_dim: 2  # delta x, delta y
 keypoint_dim: 0
@@ -16,8 +17,9 @@ dataset:
   val_ratio: 0.05
   max_train_episodes: null
   action_mode: delta  # delta, position, or velocity
+  frame_stride: ${task.frame_stride}
   n_lookahead: ${task.n_lookahead}
-  lookahead_stride: ${task.lookahead_stride}
+  k_lookahead: ${task.k_lookahead}
 
 env_runner:
   _target_: diffusion_policy.env_runner.guide_lowdim_runner.GuideLowdimRunner
@@ -32,4 +34,7 @@ env_runner:
   pad_after: ${eval:'${n_action_steps}-1'}
   val_ratio: ${task.dataset.val_ratio}
   action_mode: ${task.dataset.action_mode}
+  frame_stride: ${task.frame_stride}
+  n_lookahead: ${task.n_lookahead}
+  k_lookahead: ${task.k_lookahead}
   tqdm_interval_sec: 5.0

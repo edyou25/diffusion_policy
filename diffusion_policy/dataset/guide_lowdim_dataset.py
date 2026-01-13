@@ -27,16 +27,22 @@ class GuideLowdimDataset(BaseLowdimDataset):
         val_ratio: float = 0.0,
         max_train_episodes: Optional[int] = None,
         action_mode: str = "delta",
+        frame_stride: int = 1,
         n_lookahead: int = 10,
-        lookahead_stride: int = 1,
+        k_lookahead: Optional[int] = None,
+        lookahead_stride: Optional[int] = None,
     ):
         super().__init__()
 
         self.data_dir = Path(data_dir)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"data_dir not found: {self.data_dir}")
+        self.frame_stride = max(1, int(frame_stride))
         self.n_lookahead = max(0, int(n_lookahead))
-        self.lookahead_stride = max(1, int(lookahead_stride))
+        stride = k_lookahead if k_lookahead is not None else lookahead_stride
+        if stride is None:
+            stride = 5
+        self.lookahead_stride = max(1, int(stride))
 
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
         episode_dirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
@@ -94,19 +100,37 @@ class GuideLowdimDataset(BaseLowdimDataset):
 
         robot = np.asarray(root["robot_path"][:], dtype=np.float32)
         human = np.asarray(root["human_path"][:], dtype=np.float32)
+        timestamps = None
+        if "timestamps" in root:
+            timestamps = np.asarray(root["timestamps"][:], dtype=np.float32)
         length = min(len(robot), len(human))
+        if timestamps is not None:
+            length = min(length, len(timestamps))
         if length < 2:
             print(f"[warn] episode too short in {traj_path} (len={length})")
             return None
         robot = robot[:length]
         human = human[:length]
+        if timestamps is not None:
+            timestamps = timestamps[:length]
+
+        if self.frame_stride > 1:
+            indices = np.arange(0, length, self.frame_stride)
+            robot = robot[indices]
+            human = human[indices]
+            if timestamps is not None:
+                timestamps = timestamps[indices]
+            length = min(len(robot), len(human))
+            if length < 2:
+                print(f"[warn] episode too short after stride in {traj_path} (len={length})")
+                return None
 
         ref_path = self._load_reference_path(traj_path)
         headings = self._compute_headings(robot)
         ref_features = self._build_reference_features(robot, headings, ref_path)
 
         obs = np.concatenate([robot, human, ref_features], axis=-1).astype(np.float32)
-        action = self._build_action(robot, root, length, action_mode)
+        action = self._build_action(robot, root, length, action_mode, timestamps)
         return {"obs": obs, "action": action}
 
     def _load_reference_path(self, traj_path: Path) -> Optional[np.ndarray]:
@@ -173,6 +197,7 @@ class GuideLowdimDataset(BaseLowdimDataset):
         root: zarr.Group,
         length: int,
         action_mode: str,
+        timestamps: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if action_mode == "delta":
             delta = robot[1:] - robot[:-1]
@@ -181,9 +206,12 @@ class GuideLowdimDataset(BaseLowdimDataset):
         elif action_mode == "position":
             action = robot.astype(np.float32)
         elif action_mode == "velocity":
-            if "timestamps" not in root:
+            if timestamps is None:
+                if "timestamps" not in root:
+                    raise ValueError("action_mode='velocity' requires timestamps in trajectory.zarr")
+                timestamps = np.asarray(root["timestamps"][:length], dtype=np.float32)
+            if timestamps is None:
                 raise ValueError("action_mode='velocity' requires timestamps in trajectory.zarr")
-            timestamps = np.asarray(root["timestamps"][:length], dtype=np.float32)
             if len(timestamps) < 2:
                 raise ValueError("timestamps too short for velocity action")
             dt = np.diff(timestamps)

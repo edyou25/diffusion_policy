@@ -4,7 +4,7 @@ This runner evaluates the policy by comparing predicted robot trajectories
 with ground truth trajectories from the validation set.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 import numpy as np
 import torch
 import tqdm
@@ -36,6 +36,10 @@ class GuideLowdimRunner(BaseLowdimRunner):
         pad_after: int = 7,
         val_ratio: float = 0.05,
         action_mode: str = "delta",
+        n_lookahead: int = 20,
+        k_lookahead: int = 5,
+        lookahead_stride: Optional[int] = None,
+        frame_stride: int = 1,
         tqdm_interval_sec: float = 5.0,
         **kwargs
     ):
@@ -67,6 +71,10 @@ class GuideLowdimRunner(BaseLowdimRunner):
             val_ratio=val_ratio,
             max_train_episodes=None,  # Use all episodes for validation
             action_mode=action_mode,
+            n_lookahead=n_lookahead,
+            k_lookahead=k_lookahead,
+            lookahead_stride=lookahead_stride,
+            frame_stride=frame_stride,
         )
         
         # Get validation episodes from replay buffer
