@@ -4,7 +4,7 @@ n_lookahead: 10
 k_lookahead: 5
 frame_stride: 5
 obs_dim: ${eval:'4 + 2*${task.n_lookahead}'}  # robot(2) + human(2) + lookahead
-action_dim: 2  # delta x, delta y
+action_dim: 2  # forward_delta, heading_delta
 keypoint_dim: 0
 
 dataset:
@@ -16,10 +16,12 @@ dataset:
   seed: 42
   val_ratio: 0.05
   max_train_episodes: null
-  action_mode: delta  # delta, position, or velocity
+  action_mode: forward_heading  # delta, forward_heading, position, or velocity
   frame_stride: ${task.frame_stride}
   n_lookahead: ${task.n_lookahead}
   k_lookahead: ${task.k_lookahead}
+  robot_frame: true  # robot-centric obs/action; prevents memorizing global route
+  robot_state: vel   # robot-centric self state (2D): vel (vx,vy) or zero
 
 env_runner:
   _target_: diffusion_policy.env_runner.guide_lowdim_runner.GuideLowdimRunner
@@ -37,4 +39,5 @@ env_runner:
   frame_stride: ${task.frame_stride}
   n_lookahead: ${task.n_lookahead}
   k_lookahead: ${task.k_lookahead}
+  robot_frame: ${task.dataset.robot_frame}
   tqdm_interval_sec: 5.0

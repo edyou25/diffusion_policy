@@ -26,11 +26,13 @@ class GuideLowdimDataset(BaseLowdimDataset):
         seed: int = 42,
         val_ratio: float = 0.0,
         max_train_episodes: Optional[int] = None,
-        action_mode: str = "delta",
+        action_mode: str = "forward_heading",
         frame_stride: int = 1,
         n_lookahead: int = 10,
         k_lookahead: Optional[int] = None,
         lookahead_stride: Optional[int] = None,
+        robot_frame: bool = True,
+        robot_state: str = "vel",
     ):
         super().__init__()
 
@@ -39,10 +41,23 @@ class GuideLowdimDataset(BaseLowdimDataset):
             raise FileNotFoundError(f"data_dir not found: {self.data_dir}")
         self.frame_stride = max(1, int(frame_stride))
         self.n_lookahead = max(0, int(n_lookahead))
+        self.robot_frame = bool(robot_frame)
+        self.robot_state = str(robot_state)
         stride = k_lookahead if k_lookahead is not None else lookahead_stride
         if stride is None:
             stride = 5
         self.lookahead_stride = max(1, int(stride))
+
+        if self.robot_frame and action_mode == "position":
+            raise ValueError(
+                "robot_frame=True is incompatible with action_mode='position' "
+                "(absolute position is not robot-centric). Use 'delta' or 'velocity'."
+            )
+        if (action_mode == "forward_heading") and (not self.robot_frame):
+            raise ValueError(
+                "action_mode='forward_heading' requires robot_frame=True "
+                "(forward/heading is robot-centric)."
+            )
 
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
         episode_dirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
@@ -129,8 +144,25 @@ class GuideLowdimDataset(BaseLowdimDataset):
         headings = self._compute_headings(robot)
         ref_features = self._build_reference_features(robot, headings, ref_path)
 
-        obs = np.concatenate([robot, human, ref_features], axis=-1).astype(np.float32)
-        action = self._build_action(robot, root, length, action_mode, timestamps)
+        robot_obs, human_obs = robot, human
+        if self.robot_frame:
+            human_obs = self._to_robot_frame(points=human, origin=robot, headings=headings)
+            robot_obs = self._build_robot_state(
+                robot=robot,
+                headings=headings,
+                timestamps=timestamps,
+                mode=self.robot_state,
+            )
+
+        obs = np.concatenate([robot_obs, human_obs, ref_features], axis=-1).astype(np.float32)
+        action = self._build_action(
+            robot=robot,
+            root=root,
+            length=length,
+            action_mode=action_mode,
+            timestamps=timestamps,
+            headings=headings if self.robot_frame else None,
+        )
         return {"obs": obs, "action": action}
 
     def _load_reference_path(self, traj_path: Path) -> Optional[np.ndarray]:
@@ -161,6 +193,57 @@ class GuideLowdimDataset(BaseLowdimDataset):
             if np.linalg.norm(diffs[i - 1]) < 1e-6:
                 headings[i] = headings[i - 1]
         return headings
+
+    def _wrap_angle(self, angles: np.ndarray) -> np.ndarray:
+        return (angles + np.pi) % (2 * np.pi) - np.pi
+
+    def _build_robot_state(
+        self,
+        robot: np.ndarray,
+        headings: np.ndarray,
+        timestamps: Optional[np.ndarray],
+        mode: str,
+    ) -> np.ndarray:
+        mode = str(mode).lower()
+        if mode in ("zero", "zeros", "none"):
+            return np.zeros_like(robot, dtype=np.float32)
+        if mode not in ("vel", "velocity"):
+            raise ValueError(f"Unsupported robot_state: {mode}")
+
+        if len(robot) < 2:
+            return np.zeros_like(robot, dtype=np.float32)
+
+        diffs = np.zeros_like(robot, dtype=np.float32)
+        diffs[1:] = (robot[1:] - robot[:-1]).astype(np.float32)
+        diffs[0] = diffs[1]
+
+        if timestamps is not None and len(timestamps) == len(robot):
+            dt = np.zeros((len(robot),), dtype=np.float32)
+            dt[1:] = np.diff(timestamps).astype(np.float32)
+            dt[0] = dt[1]
+            dt = np.where(dt <= 1e-6, 1e-6, dt)
+            vel_world = diffs / dt[:, None]
+        else:
+            vel_world = diffs
+
+        cos_h = np.cos(headings).astype(np.float32)
+        sin_h = np.sin(headings).astype(np.float32)
+        vx = cos_h * vel_world[:, 0] + sin_h * vel_world[:, 1]
+        vy = -sin_h * vel_world[:, 0] + cos_h * vel_world[:, 1]
+        return np.stack([vx, vy], axis=-1).astype(np.float32)
+
+    def _to_robot_frame(
+        self,
+        points: np.ndarray,
+        origin: np.ndarray,
+        headings: np.ndarray,
+    ) -> np.ndarray:
+        rel = (points - origin).astype(np.float32)
+        cos_h = np.cos(headings).astype(np.float32)
+        sin_h = np.sin(headings).astype(np.float32)
+        x = cos_h * rel[:, 0] + sin_h * rel[:, 1]
+        y = -sin_h * rel[:, 0] + cos_h * rel[:, 1]
+        return np.stack([x, y], axis=-1).astype(np.float32)
 
     def _build_reference_features(
         self,
@@ -198,11 +281,27 @@ class GuideLowdimDataset(BaseLowdimDataset):
         length: int,
         action_mode: str,
         timestamps: Optional[np.ndarray] = None,
+        headings: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if action_mode == "delta":
             delta = robot[1:] - robot[:-1]
             last = delta[-1:] if delta.shape[0] > 0 else np.zeros((1, 2), dtype=np.float32)
             action = np.concatenate([delta, last], axis=0).astype(np.float32)
+        elif action_mode == "forward_heading":
+            if headings is None:
+                raise ValueError("action_mode='forward_heading' requires headings")
+            delta = robot[1:] - robot[:-1]
+            cos_h = np.cos(headings[:-1]).astype(np.float32)
+            sin_h = np.sin(headings[:-1]).astype(np.float32)
+            forward = cos_h * delta[:, 0] + sin_h * delta[:, 1]
+            heading_delta = self._wrap_angle(headings[1:] - headings[:-1]).astype(np.float32)
+            last_forward = forward[-1:] if forward.shape[0] > 0 else np.zeros((1,), dtype=np.float32)
+            last_heading = (
+                heading_delta[-1:] if heading_delta.shape[0] > 0 else np.zeros((1,), dtype=np.float32)
+            )
+            forward_full = np.concatenate([forward, last_forward], axis=0)
+            heading_full = np.concatenate([heading_delta, last_heading], axis=0)
+            action = np.stack([forward_full, heading_full], axis=-1).astype(np.float32)
         elif action_mode == "position":
             action = robot.astype(np.float32)
         elif action_mode == "velocity":
@@ -221,6 +320,17 @@ class GuideLowdimDataset(BaseLowdimDataset):
             action = np.concatenate([vel, last], axis=0).astype(np.float32)
         else:
             raise ValueError(f"Unsupported action_mode: {action_mode}")
+
+        if headings is not None:
+            if len(headings) != length:
+                raise ValueError("headings length mismatch")
+            if action_mode in ("delta", "velocity"):
+                # rotate per-timestep action into robot/body frame
+                cos_h = np.cos(headings).astype(np.float32)
+                sin_h = np.sin(headings).astype(np.float32)
+                x = cos_h * action[:, 0] + sin_h * action[:, 1]
+                y = -sin_h * action[:, 0] + cos_h * action[:, 1]
+                action = np.stack([x, y], axis=-1).astype(np.float32)
 
         if action.shape[0] != length:
             action = action[:length]

@@ -35,11 +35,12 @@ class GuideLowdimRunner(BaseLowdimRunner):
         pad_before: int = 1,
         pad_after: int = 7,
         val_ratio: float = 0.05,
-        action_mode: str = "delta",
+        action_mode: str = "forward_heading",
         n_lookahead: int = 20,
         k_lookahead: int = 5,
         lookahead_stride: Optional[int] = None,
         frame_stride: int = 1,
+        robot_frame: bool = True,
         tqdm_interval_sec: float = 5.0,
         **kwargs
     ):
@@ -56,7 +57,7 @@ class GuideLowdimRunner(BaseLowdimRunner):
             pad_before: Padding before sequence
             pad_after: Padding after sequence
             val_ratio: Validation ratio (should match training)
-            action_mode: Action mode (delta, position, velocity)
+            action_mode: Action mode (delta, forward_heading, position, velocity)
             tqdm_interval_sec: Progress bar update interval
         """
         super().__init__(output_dir)
@@ -75,6 +76,7 @@ class GuideLowdimRunner(BaseLowdimRunner):
             k_lookahead=k_lookahead,
             lookahead_stride=lookahead_stride,
             frame_stride=frame_stride,
+            robot_frame=robot_frame,
         )
         
         # Get validation episodes from replay buffer
@@ -98,6 +100,7 @@ class GuideLowdimRunner(BaseLowdimRunner):
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
         self.action_mode = action_mode
+        self.robot_frame = bool(robot_frame)
         self.tqdm_interval_sec = tqdm_interval_sec
         
         # Create output directory for visualizations
@@ -123,28 +126,19 @@ class GuideLowdimRunner(BaseLowdimRunner):
         """
         # Reconstruct trajectories from actions
         if self.action_mode == "delta":
-            # Cumulative sum for delta actions
-            pred_traj = np.cumsum(
-                np.concatenate([initial_robot_pos[None], pred_actions], axis=0),
-                axis=0
-            )
-            gt_traj = np.cumsum(
-                np.concatenate([initial_robot_pos[None], gt_actions], axis=0),
-                axis=0
-            )
+            # Cumulative sum for delta actions (no extra initial point)
+            pred_traj = initial_robot_pos[None, :] + np.cumsum(pred_actions, axis=0)
+            gt_traj = initial_robot_pos[None, :] + np.cumsum(gt_actions, axis=0)
+        elif self.action_mode == "forward_heading":
+            pred_traj = self._integrate_forward_heading(pred_actions, initial_robot_pos)
+            gt_traj = self._integrate_forward_heading(gt_actions, initial_robot_pos)
         elif self.action_mode == "position":
             pred_traj = pred_actions
             gt_traj = gt_actions
         else:  # velocity
             # For velocity, we'd need timestamps, so use delta approximation
-            pred_traj = np.cumsum(
-                np.concatenate([initial_robot_pos[None], pred_actions], axis=0),
-                axis=0
-            )
-            gt_traj = np.cumsum(
-                np.concatenate([initial_robot_pos[None], gt_actions], axis=0),
-                axis=0
-            )
+            pred_traj = initial_robot_pos[None, :] + np.cumsum(pred_actions, axis=0)
+            gt_traj = initial_robot_pos[None, :] + np.cumsum(gt_actions, axis=0)
         
         # Compute errors
         position_errors = np.linalg.norm(pred_traj - gt_traj, axis=-1)
@@ -157,6 +151,22 @@ class GuideLowdimRunner(BaseLowdimRunner):
             'mean_action_error': float(np.mean(action_errors)),
             'max_action_error': float(np.max(action_errors)),
         }
+
+    def _integrate_forward_heading(
+        self,
+        actions: np.ndarray,
+        initial_robot_pos: np.ndarray,
+        initial_heading: float = 0.0,
+    ) -> np.ndarray:
+        pos = np.asarray(initial_robot_pos, dtype=np.float32).copy()
+        heading = float(initial_heading)
+        traj = np.zeros((len(actions), 2), dtype=np.float32)
+        for i, act in enumerate(actions):
+            forward = float(act[0])
+            heading += float(act[1])
+            pos = pos + np.array([np.cos(heading), np.sin(heading)], dtype=np.float32) * forward
+            traj[i] = pos
+        return traj
     
     def run(self, policy: BaseLowdimPolicy) -> Dict:
         """
@@ -191,10 +201,6 @@ class GuideLowdimRunner(BaseLowdimRunner):
                 episode = replay_buffer.get_episode(ep_idx)
                 obs_episode = episode['obs']  # (T, D) - [robot, human, lookahead...]
                 action_episode = episode['action']  # (T, 2)
-                
-                # Extract robot and human trajectories
-                robot_traj = obs_episode[:, :2]  # (T, 2)
-                human_traj = obs_episode[:, 2:4]  # (T, 2)
                 
                 # Evaluate on sliding windows
                 episode_errors = []
@@ -239,7 +245,7 @@ class GuideLowdimRunner(BaseLowdimRunner):
                         gt_actions = gt_actions[:len(pred_actions)]
                     
                     # Compute errors
-                    initial_robot_pos = robot_traj[action_start]
+                    initial_robot_pos = np.zeros((2,), dtype=np.float32) if self.robot_frame else obs_episode[action_start, :2]
                     errors = self._compute_trajectory_error(
                         pred_actions, gt_actions, initial_robot_pos
                     )
