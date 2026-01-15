@@ -22,6 +22,7 @@ dataset:
   k_lookahead: ${task.k_lookahead}
   robot_frame: true  # robot-centric obs/action; prevents memorizing global route
   robot_state: vel   # robot-centric self state (2D): vel (vx,vy) or zero
+  turn_speed: 1.5    # rad/s, used to clip heading_delta when timestamps exist
 
 env_runner:
   _target_: diffusion_policy.env_runner.guide_lowdim_runner.GuideLowdimRunner

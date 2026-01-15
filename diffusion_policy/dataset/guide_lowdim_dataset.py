@@ -33,6 +33,8 @@ class GuideLowdimDataset(BaseLowdimDataset):
         lookahead_stride: Optional[int] = None,
         robot_frame: bool = True,
         robot_state: str = "vel",
+        turn_speed: Optional[float] = None,
+        heading_delta_limit: Optional[float] = None,
     ):
         super().__init__()
 
@@ -43,6 +45,10 @@ class GuideLowdimDataset(BaseLowdimDataset):
         self.n_lookahead = max(0, int(n_lookahead))
         self.robot_frame = bool(robot_frame)
         self.robot_state = str(robot_state)
+        self.turn_speed = None if turn_speed is None else float(turn_speed)
+        self.heading_delta_limit = (
+            None if heading_delta_limit is None else float(heading_delta_limit)
+        )
         stride = k_lookahead if k_lookahead is not None else lookahead_stride
         if stride is None:
             stride = 5
@@ -306,6 +312,14 @@ class GuideLowdimDataset(BaseLowdimDataset):
             sin_h = np.sin(headings[:-1]).astype(np.float32)
             forward = cos_h * delta[:, 0] + sin_h * delta[:, 1]
             heading_delta = self._wrap_angle(headings[1:] - headings[:-1]).astype(np.float32)
+            if self.heading_delta_limit is not None:
+                limit = float(self.heading_delta_limit)
+                heading_delta = np.clip(heading_delta, -limit, limit)
+            elif (self.turn_speed is not None) and (timestamps is not None) and (len(timestamps) >= 2):
+                dt = np.diff(timestamps[:len(headings)]).astype(np.float32)
+                dt = np.where(dt <= 1e-6, 1e-6, dt)
+                max_delta = float(self.turn_speed) * dt
+                heading_delta = np.clip(heading_delta, -max_delta, max_delta)
             last_forward = forward[-1:] if forward.shape[0] > 0 else np.zeros((1,), dtype=np.float32)
             last_heading = (
                 heading_delta[-1:] if heading_delta.shape[0] > 0 else np.zeros((1,), dtype=np.float32)
