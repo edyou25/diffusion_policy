@@ -129,19 +129,30 @@ class GuideLowdimDataset(BaseLowdimDataset):
         if timestamps is not None:
             timestamps = timestamps[:length]
 
+        headings_full = self._compute_headings(robot)
+
         if self.frame_stride > 1:
             indices = np.arange(0, length, self.frame_stride)
             robot = robot[indices]
             human = human[indices]
+            headings = headings_full[indices]
             if timestamps is not None:
                 timestamps = timestamps[indices]
-            length = min(len(robot), len(human))
+            length = min(len(robot), len(human), len(headings))
+            if timestamps is not None:
+                length = min(length, len(timestamps))
             if length < 2:
                 print(f"[warn] episode too short after stride in {traj_path} (len={length})")
                 return None
+            robot = robot[:length]
+            human = human[:length]
+            headings = headings[:length]
+            if timestamps is not None:
+                timestamps = timestamps[:length]
+        else:
+            headings = headings_full
 
         ref_path = self._load_reference_path(traj_path)
-        headings = self._compute_headings(robot)
         ref_features = self._build_reference_features(robot, headings, ref_path)
 
         robot_obs, human_obs = robot, human
