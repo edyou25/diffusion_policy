@@ -41,6 +41,9 @@ class GuideLowdimRunner(BaseLowdimRunner):
         lookahead_stride: Optional[int] = None,
         frame_stride: int = 1,
         robot_frame: bool = True,
+        n_obstacle_circles: int = 0,
+        n_obstacle_segments: int = 0,
+        obstacle_include_radius: bool = True,
         tqdm_interval_sec: float = 5.0,
         **kwargs
     ):
@@ -77,6 +80,9 @@ class GuideLowdimRunner(BaseLowdimRunner):
             lookahead_stride=lookahead_stride,
             frame_stride=frame_stride,
             robot_frame=robot_frame,
+            n_obstacle_circles=n_obstacle_circles,
+            n_obstacle_segments=n_obstacle_segments,
+            obstacle_include_radius=obstacle_include_radius,
         )
         
         # Get validation episodes from replay buffer

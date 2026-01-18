@@ -35,6 +35,9 @@ class GuideLowdimDataset(BaseLowdimDataset):
         robot_state: str = "vel",
         turn_speed: Optional[float] = None,
         heading_delta_limit: Optional[float] = None,
+        n_obstacle_circles: int = 0,
+        n_obstacle_segments: int = 0,
+        obstacle_include_radius: bool = True,
     ):
         super().__init__()
 
@@ -49,6 +52,9 @@ class GuideLowdimDataset(BaseLowdimDataset):
         self.heading_delta_limit = (
             None if heading_delta_limit is None else float(heading_delta_limit)
         )
+        self.n_obstacle_circles = max(0, int(n_obstacle_circles))
+        self.n_obstacle_segments = max(0, int(n_obstacle_segments))
+        self.obstacle_include_radius = bool(obstacle_include_radius)
         stride = k_lookahead if k_lookahead is not None else lookahead_stride
         if stride is None:
             stride = 5
@@ -158,8 +164,16 @@ class GuideLowdimDataset(BaseLowdimDataset):
         else:
             headings = headings_full
 
-        ref_path = self._load_reference_path(traj_path)
+        meta, meta_path = self._load_metadata(traj_path)
+        ref_path = self._load_reference_path(meta, meta_path)
+        circle_obs, segment_obs = self._load_obstacles(meta, meta_path)
         ref_features = self._build_reference_features(robot, headings, ref_path)
+        obstacle_features = self._build_obstacle_features(
+            robot=robot,
+            headings=headings,
+            circle_obs=circle_obs,
+            segment_obs=segment_obs,
+        )
 
         robot_obs, human_obs = robot, human
         if self.robot_frame:
@@ -171,7 +185,9 @@ class GuideLowdimDataset(BaseLowdimDataset):
                 mode=self.robot_state,
             )
 
-        obs = np.concatenate([robot_obs, human_obs, ref_features], axis=-1).astype(np.float32)
+        obs = np.concatenate(
+            [robot_obs, human_obs, ref_features, obstacle_features], axis=-1
+        ).astype(np.float32)
         action = self._build_action(
             robot=robot,
             root=root,
@@ -182,22 +198,53 @@ class GuideLowdimDataset(BaseLowdimDataset):
         )
         return {"obs": obs, "action": action}
 
-    def _load_reference_path(self, traj_path: Path) -> Optional[np.ndarray]:
+    def _load_metadata(self, traj_path: Path) -> tuple[Optional[dict], Path]:
         meta_path = traj_path.parent / "metadata.json"
         if not meta_path.exists():
             print(f"[warn] metadata.json not found for {traj_path}")
-            return None
+            return None, meta_path
         try:
             with meta_path.open("r", encoding="utf-8") as f:
                 meta = json.load(f)
         except Exception as exc:
             print(f"[warn] failed to load metadata {meta_path}: {exc}")
+            return None, meta_path
+        return meta, meta_path
+
+    def _load_reference_path(
+        self, meta: Optional[dict], meta_path: Path
+    ) -> Optional[np.ndarray]:
+        if not meta:
             return None
         ref = np.asarray(meta.get("reference_path", []), dtype=np.float32)
         if ref.ndim != 2 or ref.shape[1] != 2:
             print(f"[warn] invalid reference_path in {meta_path}")
             return None
         return ref
+
+    def _load_obstacles(
+        self, meta: Optional[dict], meta_path: Path
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not meta:
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 4), dtype=np.float32),
+            )
+        circle = np.asarray(meta.get("obstacles", []), dtype=np.float32)
+        if circle.ndim != 2 or circle.shape[1] < 3:
+            if len(circle) > 0:
+                print(f"[warn] invalid obstacles in {meta_path}")
+            circle = np.zeros((0, 3), dtype=np.float32)
+        else:
+            circle = circle[:, :3]
+        segment = np.asarray(meta.get("segment_obstacles", []), dtype=np.float32)
+        if segment.ndim != 2 or segment.shape[1] < 4:
+            if len(segment) > 0:
+                print(f"[warn] invalid segment_obstacles in {meta_path}")
+            segment = np.zeros((0, 4), dtype=np.float32)
+        else:
+            segment = segment[:, :4]
+        return circle, segment
 
     def _compute_headings(self, robot: np.ndarray) -> np.ndarray:
         if len(robot) < 2:
@@ -290,6 +337,89 @@ class GuideLowdimDataset(BaseLowdimDataset):
             features[t, :, 0] = cos_h * rel[:, 0] + sin_h * rel[:, 1]
             features[t, :, 1] = -sin_h * rel[:, 0] + cos_h * rel[:, 1]
         return features.reshape(length, -1)
+
+    def _build_obstacle_features(
+        self,
+        robot: np.ndarray,
+        headings: np.ndarray,
+        circle_obs: np.ndarray,
+        segment_obs: np.ndarray,
+    ) -> np.ndarray:
+        length = len(robot)
+        circle_dim = 3 if self.obstacle_include_radius else 2
+        total_dim = self.n_obstacle_circles * circle_dim + self.n_obstacle_segments * 4
+        if total_dim == 0:
+            return np.zeros((length, 0), dtype=np.float32)
+
+        feats = np.zeros((length, total_dim), dtype=np.float32)
+        if length == 0:
+            return feats
+
+        for t in range(length):
+            offset = 0
+            if self.n_obstacle_circles > 0:
+                if circle_obs is not None and len(circle_obs) > 0:
+                    centers = circle_obs[:, :2]
+                    radii = circle_obs[:, 2]
+                    rel = centers - robot[t]
+                    dist_sq = np.sum(rel * rel, axis=1)
+                    order = np.argsort(dist_sq)
+                    count = min(self.n_obstacle_circles, len(order))
+                    for i in range(self.n_obstacle_circles):
+                        if i < count:
+                            rel_i = rel[order[i]]
+                            if self.robot_frame:
+                                rel_i = self._rotate_rel(rel_i, headings[t])
+                            feats[t, offset : offset + 2] = rel_i
+                            if self.obstacle_include_radius:
+                                feats[t, offset + 2] = radii[order[i]]
+                        offset += circle_dim
+                else:
+                    offset += self.n_obstacle_circles * circle_dim
+
+            if self.n_obstacle_segments > 0:
+                if segment_obs is not None and len(segment_obs) > 0:
+                    dist_sq = np.zeros((len(segment_obs),), dtype=np.float32)
+                    for i, seg in enumerate(segment_obs):
+                        p1 = seg[:2]
+                        p2 = seg[2:4]
+                        dist_sq[i] = self._point_segment_dist_sq(robot[t], p1, p2)
+                    order = np.argsort(dist_sq)
+                    count = min(self.n_obstacle_segments, len(order))
+                    for i in range(self.n_obstacle_segments):
+                        if i < count:
+                            seg = segment_obs[order[i]]
+                            p1 = seg[:2] - robot[t]
+                            p2 = seg[2:4] - robot[t]
+                            if self.robot_frame:
+                                p1 = self._rotate_rel(p1, headings[t])
+                                p2 = self._rotate_rel(p2, headings[t])
+                            feats[t, offset : offset + 4] = [p1[0], p1[1], p2[0], p2[1]]
+                        offset += 4
+                else:
+                    offset += self.n_obstacle_segments * 4
+
+        return feats
+
+    def _rotate_rel(self, rel: np.ndarray, heading: float) -> np.ndarray:
+        cos_h = float(np.cos(heading))
+        sin_h = float(np.sin(heading))
+        return np.array(
+            [cos_h * rel[0] + sin_h * rel[1], -sin_h * rel[0] + cos_h * rel[1]],
+            dtype=np.float32,
+        )
+
+    def _point_segment_dist_sq(self, point: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> float:
+        ab = p2 - p1
+        denom = float(np.dot(ab, ab))
+        if denom < 1e-12:
+            diff = point - p1
+            return float(np.dot(diff, diff))
+        t = float(np.dot(point - p1, ab)) / denom
+        t = float(np.clip(t, 0.0, 1.0))
+        closest = p1 + t * ab
+        diff = point - closest
+        return float(np.dot(diff, diff))
 
     def _build_action(
         self,
