@@ -3,8 +3,8 @@ name: guide_lowdim
 n_lookahead: 10
 k_lookahead: 5
 frame_stride: 5
-n_obstacle_circles: 4
-n_obstacle_segments: 4
+n_obstacle_circles: 6
+n_obstacle_segments: 6
 obstacle_dim: ${eval:'${task.n_obstacle_circles}*3 + ${task.n_obstacle_segments}*4'}
 obs_dim: ${eval:'4 + 2*${task.n_lookahead} + ${task.obstacle_dim}'}  # robot(2) + human(2) + lookahead + obstacles
 action_dim: 2  # forward_delta, heading_delta
@@ -29,6 +29,7 @@ dataset:
   n_obstacle_circles: ${task.n_obstacle_circles}
   n_obstacle_segments: ${task.n_obstacle_segments}
   obstacle_include_radius: true
+  segment_repr: closest_dir  # endpoints | closest_dir
 
 env_runner:
   _target_: diffusion_policy.env_runner.guide_lowdim_runner.GuideLowdimRunner

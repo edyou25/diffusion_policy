@@ -189,6 +189,12 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        base_loss = getattr(self.model, "last_base_loss", None)
+                        if base_loss is not None:
+                            step_log["train_base_loss"] = float(base_loss.item())
+                        collision_loss = getattr(self.model, "last_collision_loss", None)
+                        if collision_loss is not None:
+                            step_log["train_collision_loss"] = float(collision_loss.item())
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:

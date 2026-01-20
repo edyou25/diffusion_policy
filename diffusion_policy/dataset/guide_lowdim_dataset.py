@@ -38,6 +38,7 @@ class GuideLowdimDataset(BaseLowdimDataset):
         n_obstacle_circles: int = 0,
         n_obstacle_segments: int = 0,
         obstacle_include_radius: bool = True,
+        segment_repr: str = "endpoints",
     ):
         super().__init__()
 
@@ -55,6 +56,7 @@ class GuideLowdimDataset(BaseLowdimDataset):
         self.n_obstacle_circles = max(0, int(n_obstacle_circles))
         self.n_obstacle_segments = max(0, int(n_obstacle_segments))
         self.obstacle_include_radius = bool(obstacle_include_radius)
+        self.segment_repr = str(segment_repr).lower()
         stride = k_lookahead if k_lookahead is not None else lookahead_stride
         if stride is None:
             stride = 5
@@ -70,6 +72,8 @@ class GuideLowdimDataset(BaseLowdimDataset):
                 "action_mode='forward_heading' requires robot_frame=True "
                 "(forward/heading is robot-centric)."
             )
+        if self.segment_repr not in ("endpoints", "closest_dir"):
+            raise ValueError(f"Unsupported segment_repr: {self.segment_repr}")
 
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
         episode_dirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
@@ -389,12 +393,42 @@ class GuideLowdimDataset(BaseLowdimDataset):
                     for i in range(self.n_obstacle_segments):
                         if i < count:
                             seg = segment_obs[order[i]]
-                            p1 = seg[:2] - robot[t]
-                            p2 = seg[2:4] - robot[t]
-                            if self.robot_frame:
-                                p1 = self._rotate_rel(p1, headings[t])
-                                p2 = self._rotate_rel(p2, headings[t])
-                            feats[t, offset : offset + 4] = [p1[0], p1[1], p2[0], p2[1]]
+                            if self.segment_repr == "endpoints":
+                                p1 = seg[:2] - robot[t]
+                                p2 = seg[2:4] - robot[t]
+                                if self.robot_frame:
+                                    p1 = self._rotate_rel(p1, headings[t])
+                                    p2 = self._rotate_rel(p2, headings[t])
+                                feats[t, offset : offset + 4] = [p1[0], p1[1], p2[0], p2[1]]
+                            else:  # closest_dir
+                                p1 = seg[:2].astype(np.float32)
+                                p2 = seg[2:4].astype(np.float32)
+                                ab = p2 - p1
+                                denom = float(np.dot(ab, ab))
+                                if denom < 1e-12:
+                                    closest = p1
+                                    direction = np.zeros((2,), dtype=np.float32)
+                                else:
+                                    t_proj = float(np.dot(robot[t] - p1, ab)) / denom
+                                    t_proj = float(np.clip(t_proj, 0.0, 1.0))
+                                    closest = p1 + t_proj * ab
+                                    direction = (ab / np.sqrt(denom)).astype(np.float32)
+                                    # canonicalize direction sign to reduce ambiguity
+                                    if (direction[0] < 0) or (
+                                        abs(direction[0]) < 1e-6 and direction[1] < 0
+                                    ):
+                                        direction = -direction
+
+                                rel = (closest - robot[t]).astype(np.float32)
+                                if self.robot_frame:
+                                    rel = self._rotate_rel(rel, headings[t])
+                                    direction = self._rotate_rel(direction, headings[t])
+                                feats[t, offset : offset + 4] = [
+                                    rel[0],
+                                    rel[1],
+                                    direction[0],
+                                    direction[1],
+                                ]
                         offset += 4
                 else:
                     offset += self.n_obstacle_segments * 4

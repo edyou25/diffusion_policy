@@ -24,6 +24,16 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             obs_as_global_cond=False,
             pred_action_steps_only=False,
             oa_step_convention=False,
+            # guide-specific auxiliary loss (optional)
+            collision_loss_weight: float = 0.0,
+            collision_loss_margin: float = 0.0,
+            collision_loss_robot_radius: float = 0.3,
+            guide_action_mode: str = "forward_heading",
+            guide_n_lookahead: int = 0,
+            guide_n_obstacle_circles: int = 0,
+            guide_n_obstacle_segments: int = 0,
+            guide_obstacle_include_radius: bool = True,
+            guide_segment_repr: str = "endpoints",
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -50,6 +60,22 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         self.pred_action_steps_only = pred_action_steps_only
         self.oa_step_convention = oa_step_convention
         self.kwargs = kwargs
+
+        # collision avoidance regularizer (only used in compute_loss)
+        self.collision_loss_weight = float(collision_loss_weight)
+        self.collision_loss_margin = float(collision_loss_margin)
+        self.collision_loss_robot_radius = float(collision_loss_robot_radius)
+        self.guide_action_mode = str(guide_action_mode).lower()
+        self.guide_n_lookahead = int(guide_n_lookahead)
+        self.guide_n_obstacle_circles = int(guide_n_obstacle_circles)
+        self.guide_n_obstacle_segments = int(guide_n_obstacle_segments)
+        self.guide_obstacle_include_radius = bool(guide_obstacle_include_radius)
+        self.guide_segment_repr = str(guide_segment_repr).lower()
+        if self.guide_segment_repr not in ("endpoints", "closest_dir"):
+            raise ValueError(f"Unsupported guide_segment_repr: {self.guide_segment_repr}")
+        self.last_base_loss = None
+        self.last_collision_loss = None
+        self.last_total_loss = None
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -245,8 +271,156 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
-        return loss
+        base_loss = F.mse_loss(pred, target, reduction='none')
+        base_loss = base_loss * loss_mask.type(base_loss.dtype)
+        base_loss = reduce(base_loss, 'b ... -> b (...)', 'mean')
+        base_loss = base_loss.mean()
+
+        collision_loss = None
+        if (
+            self.collision_loss_weight > 0
+            and self.guide_action_mode == "forward_heading"
+            and self.obs_as_global_cond
+            and ("obs" in batch)
+            and (self.guide_n_obstacle_circles > 0 or self.guide_n_obstacle_segments > 0)
+        ):
+            # Predict x0 from x_t and predicted noise.
+            if pred_type == "epsilon":
+                alphas_cumprod = self.noise_scheduler.alphas_cumprod
+                if not torch.is_tensor(alphas_cumprod):
+                    alphas_cumprod = torch.tensor(alphas_cumprod)
+                alpha_bar = alphas_cumprod.to(
+                    device=trajectory.device, dtype=trajectory.dtype
+                )[timesteps]
+                while alpha_bar.ndim < noisy_trajectory.ndim:
+                    alpha_bar = alpha_bar.view(-1, *([1] * (noisy_trajectory.ndim - 1)))
+                sqrt_alpha_bar = torch.sqrt(alpha_bar)
+                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
+                x0_pred = (noisy_trajectory - sqrt_one_minus_alpha_bar * pred) / torch.clamp(
+                    sqrt_alpha_bar, min=1e-6
+                )
+            else:
+                x0_pred = pred
+
+            # enforce conditioning (if any)
+            if condition_mask is not None:
+                x0_pred = torch.where(condition_mask, trajectory, x0_pred)
+
+            # unnormalize predicted actions to physical units
+            action_pred = self.normalizer["action"].unnormalize(x0_pred)
+
+            # slice the action window that will be executed at inference time
+            To = self.n_obs_steps
+            start = To
+            if self.oa_step_convention:
+                start = To - 1
+            if self.pred_action_steps_only:
+                action_slice = action_pred
+            else:
+                end = start + self.n_action_steps
+                action_slice = action_pred[:, start:end]
+
+            # parse obstacle features from the current observation step (robot-centric frame)
+            obs = batch["obs"]
+            obs0 = obs[:, start]
+            base_offset = 4 + 2 * self.guide_n_lookahead
+            circle_dim = 3 if self.guide_obstacle_include_radius else 2
+            circles_total = self.guide_n_obstacle_circles * circle_dim
+            seg_total = self.guide_n_obstacle_segments * 4
+
+            circles = None
+            segments = None
+            if circles_total > 0:
+                circles = obs0[:, base_offset : base_offset + circles_total].reshape(
+                    obs0.shape[0], self.guide_n_obstacle_circles, circle_dim
+                )
+            if seg_total > 0:
+                seg_offset = base_offset + circles_total
+                segments = obs0[:, seg_offset : seg_offset + seg_total].reshape(
+                    obs0.shape[0], self.guide_n_obstacle_segments, 4
+                )
+
+            # rollout kinematics in the observation frame: x forward, heading=0 at start
+            B, N, _Da = action_slice.shape
+            heading = torch.zeros((B,), device=action_slice.device, dtype=action_slice.dtype)
+            pos = torch.zeros((B, 2), device=action_slice.device, dtype=action_slice.dtype)
+            positions = []
+            for i in range(N):
+                forward = action_slice[:, i, 0]
+                dtheta = action_slice[:, i, 1]
+                heading = heading + dtheta
+                step = torch.stack([torch.cos(heading), torch.sin(heading)], dim=-1) * forward.unsqueeze(-1)
+                pos = pos + step
+                positions.append(pos)
+            pos_pred = torch.stack(positions, dim=1) if positions else pos.unsqueeze(1)
+
+            margin = float(self.collision_loss_margin)
+            robot_r = float(self.collision_loss_robot_radius)
+
+            per_sample_pen = torch.zeros((B,), device=action_slice.device, dtype=action_slice.dtype)
+
+            if circles is not None and circles.numel() > 0:
+                centers = circles[..., :2]
+                if self.guide_obstacle_include_radius:
+                    radii = circles[..., 2]
+                    valid = radii > 1e-6
+                else:
+                    radii = torch.zeros(
+                        (B, centers.shape[1]), device=centers.device, dtype=centers.dtype
+                    )
+                    valid = torch.linalg.norm(centers, dim=-1) > 1e-6
+
+                diff = pos_pred[:, :, None, :] - centers[:, None, :, :]
+                dist = torch.linalg.norm(diff, dim=-1)
+                dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
+                clearance = dist - (radii[:, None, :] + robot_r)
+                circle_pen = torch.relu(margin - clearance) ** 2
+                per_sample_pen = per_sample_pen + circle_pen.min(dim=-1).values.mean(dim=-1)
+
+            if segments is not None and segments.numel() > 0:
+                if self.guide_segment_repr == "endpoints":
+                    p1 = segments[..., :2]
+                    p2 = segments[..., 2:4]
+                    ab = p2 - p1
+                    denom = (ab * ab).sum(dim=-1, keepdim=True)
+                    valid = denom.squeeze(-1) > 1e-8
+
+                    ap = pos_pred[:, :, None, :] - p1[:, None, :, :]
+                    t_proj = (ap * ab[:, None, :, :]).sum(dim=-1, keepdim=True) / torch.clamp(
+                        denom[:, None, :, :], min=1e-8
+                    )
+                    t_proj = torch.clamp(t_proj, 0.0, 1.0)
+                    closest = p1[:, None, :, :] + t_proj * ab[:, None, :, :]
+                    diff = pos_pred[:, :, None, :] - closest
+                    dist = torch.linalg.norm(diff, dim=-1)
+                    dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
+                else:  # closest_dir, approximate walls as infinite lines
+                    c = segments[..., :2]
+                    d = segments[..., 2:4]
+                    d_norm = torch.linalg.norm(d, dim=-1, keepdim=True)
+                    valid = d_norm.squeeze(-1) > 1e-6
+                    d_unit = d / torch.clamp(d_norm, min=1e-6)
+                    delta = pos_pred[:, :, None, :] - c[:, None, :, :]
+                    cross = delta[..., 0] * d_unit[:, None, :, 1] - delta[..., 1] * d_unit[:, None, :, 0]
+                    dist = cross.abs()
+                    dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
+
+                clearance = dist - robot_r
+                seg_pen = torch.relu(margin - clearance) ** 2
+                per_sample_pen = per_sample_pen + seg_pen.min(dim=-1).values.mean(dim=-1)
+
+            # downweight collision penalty when the diffusion timestep is very noisy
+            if pred_type == "epsilon":
+                w = alpha_bar.reshape(B)
+            else:
+                w = torch.ones((B,), device=per_sample_pen.device, dtype=per_sample_pen.dtype)
+            collision_loss = (per_sample_pen * w).mean()
+
+        total_loss = base_loss
+        if collision_loss is not None:
+            total_loss = total_loss + (self.collision_loss_weight * collision_loss)
+
+        self.last_base_loss = base_loss.detach()
+        self.last_collision_loss = None if collision_loss is None else collision_loss.detach()
+        self.last_total_loss = total_loss.detach()
+        return total_loss
