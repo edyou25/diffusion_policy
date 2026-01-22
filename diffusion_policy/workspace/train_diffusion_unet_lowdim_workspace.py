@@ -195,6 +195,13 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                         collision_loss = getattr(self.model, "last_collision_loss", None)
                         if collision_loss is not None:
                             step_log["train_collision_loss"] = float(collision_loss.item())
+                        human_collision_loss = getattr(
+                            self.model, "last_human_collision_loss", None
+                        )
+                        if human_collision_loss is not None:
+                            step_log["train_human_collision_loss"] = float(
+                                human_collision_loss.item()
+                            )
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:

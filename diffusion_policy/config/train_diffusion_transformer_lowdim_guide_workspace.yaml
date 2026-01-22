@@ -2,38 +2,45 @@ defaults:
   - _self_
   - task: guide_lowdim
 
-name: train_diffusion_unet_lowdim_guide
-_target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
+name: train_diffusion_transformer_lowdim_guide
+_target_: diffusion_policy.workspace.train_diffusion_transformer_lowdim_workspace.TrainDiffusionTransformerLowdimWorkspace
 
 obs_dim: ${task.obs_dim}
 action_dim: ${task.action_dim}
-keypoint_dim: ${task.keypoint_dim}
 task_name: ${task.name}
 exp_name: "default"
 
-horizon: 32  # 增加到 48 以支持 3-5 米预测距离（必须能被 8 整除）
+# Keep the sequence settings consistent with the UNet guide config for fair comparison.
+horizon: 32
 n_obs_steps: 2
-n_action_steps: 16  # 增加到 24 以支持更长动作序列（需满足: horizon >= n_obs_steps + n_action_steps）
+n_action_steps: 16
 n_latency_steps: 0
 past_action_visible: False
 keypoint_visible_rate: 1.0
-obs_as_local_cond: False
-obs_as_global_cond: True
+obs_as_cond: True
 pred_action_steps_only: False
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
+  _target_: diffusion_policy.policy.diffusion_transformer_lowdim_policy.DiffusionTransformerLowdimPolicy
 
   model:
-    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
-    input_dim: "${eval: ${task.action_dim} if ${obs_as_local_cond} or ${obs_as_global_cond} else ${task.obs_dim} + ${task.action_dim}}"
-    local_cond_dim: "${eval: ${task.obs_dim} if ${obs_as_local_cond} else None}"
-    global_cond_dim: "${eval: ${task.obs_dim}*${n_obs_steps} if ${obs_as_global_cond} else None}"
-    diffusion_step_embed_dim: 256
-    down_dims: [256, 512, 1024]
-    kernel_size: 5
-    n_groups: 8
-    cond_predict_scale: True
+    _target_: diffusion_policy.model.diffusion.transformer_for_diffusion.TransformerForDiffusion
+    input_dim: ${eval:'${action_dim} if ${obs_as_cond} else ${obs_dim} + ${action_dim}'}
+    output_dim: ${policy.model.input_dim}
+    horizon: ${horizon}
+    n_obs_steps: ${n_obs_steps}
+    cond_dim: ${eval:'${obs_dim} if ${obs_as_cond} else 0'}
+
+    n_layer: 8
+    n_head: 4
+    n_emb: 256
+    p_drop_emb: 0.0
+    p_drop_attn: 0.3
+
+    causal_attn: True
+    time_as_cond: True # if false, use BERT-like encoder only arch, time as input
+    obs_as_cond: ${obs_as_cond}
+    n_cond_layers: 0 # >0: use transformer encoder for cond, otherwise use MLP
   
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
@@ -48,30 +55,11 @@ policy:
   horizon: ${horizon}
   obs_dim: ${obs_dim}
   action_dim: ${action_dim}
-  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
-  obs_as_local_cond: ${obs_as_local_cond}
-  obs_as_global_cond: ${obs_as_global_cond}
+  obs_as_cond: ${obs_as_cond}
   pred_action_steps_only: ${pred_action_steps_only}
-  oa_step_convention: True
-
-  # auxiliary collision-avoidance regularizer (guide task only)
-  collision_loss_weight: 0.05
-  collision_loss_margin: 0.05
-  collision_loss_robot_radius: 0.3
-  collision_loss_human_weight: 0.10
-  collision_loss_human_radius: ${task.dataset.human_radius}
-  guide_leash_length: 1.5
-  guide_action_mode: ${task.dataset.action_mode}
-  guide_n_lookahead: ${task.n_lookahead}
-  guide_n_obstacle_circles: ${task.n_obstacle_circles}
-  guide_n_obstacle_segments: ${task.n_obstacle_segments}
-  guide_obstacle_include_radius: ${task.dataset.obstacle_include_radius}
-  guide_segment_repr: ${task.dataset.segment_repr}
-
-  # scheduler.step params
-  # predict_epsilon: True
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -96,11 +84,9 @@ val_dataloader:
   persistent_workers: False
 
 optimizer:
-  _target_: torch.optim.AdamW
-  lr: 1.0e-4
-  betas: [0.95, 0.999]
-  eps: 1.0e-8
-  weight_decay: 1.0e-6
+  learning_rate: 3.0e-5
+  weight_decay: 1.0e-3
+  betas: [0.9, 0.95]
 
 training:
   device: "cuda:0"
@@ -108,9 +94,10 @@ training:
   debug: False
   resume: True
   # optimization
-  lr_scheduler: cosine
-  lr_warmup_steps: 100
-  num_epochs: 200
+  lr_scheduler: constant
+  # Transformer needs LR warmup
+  lr_warmup_steps: 0
+  num_epochs: 500
   gradient_accumulate_every: 1
   use_ema: True
   # training loop control
@@ -155,3 +142,4 @@ hydra:
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}
+

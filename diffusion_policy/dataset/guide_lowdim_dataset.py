@@ -38,6 +38,8 @@ class GuideLowdimDataset(BaseLowdimDataset):
         n_obstacle_circles: int = 0,
         n_obstacle_segments: int = 0,
         obstacle_include_radius: bool = True,
+        obstacle_include_human_clearance: bool = False,
+        human_radius: float = 0.3,
         segment_repr: str = "endpoints",
     ):
         super().__init__()
@@ -56,6 +58,8 @@ class GuideLowdimDataset(BaseLowdimDataset):
         self.n_obstacle_circles = max(0, int(n_obstacle_circles))
         self.n_obstacle_segments = max(0, int(n_obstacle_segments))
         self.obstacle_include_radius = bool(obstacle_include_radius)
+        self.obstacle_include_human_clearance = bool(obstacle_include_human_clearance)
+        self.human_radius = float(human_radius)
         self.segment_repr = str(segment_repr).lower()
         stride = k_lookahead if k_lookahead is not None else lookahead_stride
         if stride is None:
@@ -174,9 +178,11 @@ class GuideLowdimDataset(BaseLowdimDataset):
         ref_features = self._build_reference_features(robot, headings, ref_path)
         obstacle_features = self._build_obstacle_features(
             robot=robot,
+            human=human,
             headings=headings,
             circle_obs=circle_obs,
             segment_obs=segment_obs,
+            ref_path=ref_path,
         )
 
         robot_obs, human_obs = robot, human
@@ -345,13 +351,20 @@ class GuideLowdimDataset(BaseLowdimDataset):
     def _build_obstacle_features(
         self,
         robot: np.ndarray,
+        human: np.ndarray,
         headings: np.ndarray,
         circle_obs: np.ndarray,
         segment_obs: np.ndarray,
+        ref_path: Optional[np.ndarray],
     ) -> np.ndarray:
         length = len(robot)
         circle_dim = 3 if self.obstacle_include_radius else 2
-        total_dim = self.n_obstacle_circles * circle_dim + self.n_obstacle_segments * 4
+        clearance_dim = (
+            (self.n_obstacle_circles + self.n_obstacle_segments)
+            if self.obstacle_include_human_clearance
+            else 0
+        )
+        total_dim = self.n_obstacle_circles * circle_dim + self.n_obstacle_segments * 4 + clearance_dim
         if total_dim == 0:
             return np.zeros((length, 0), dtype=np.float32)
 
@@ -359,40 +372,106 @@ class GuideLowdimDataset(BaseLowdimDataset):
         if length == 0:
             return feats
 
+        clearance_offset = self.n_obstacle_circles * circle_dim + self.n_obstacle_segments * 4
+        circle_clear_offset = clearance_offset
+        seg_clear_offset = circle_clear_offset + self.n_obstacle_circles
+        if self.obstacle_include_human_clearance and clearance_dim > 0:
+            # For empty slots, treat clearance as safely far instead of zero (which looks like contact).
+            feats[:, clearance_offset:] = 5.0
+
+        # Precompute Frenet-like longitudinal coordinate s along the reference path.
+        # This makes obstacle selection independent of robot heading (e.g., when turning in place).
+        ref_path_f = None
+        ref_s = None
+        circle_s = None
+        seg_s_min = None
+        seg_s_max = None
+        if ref_path is not None and len(ref_path) > 0:
+            ref_path_f = np.asarray(ref_path, dtype=np.float32)
+            ref_s = self._compute_path_s(ref_path_f)
+            if circle_obs is not None and len(circle_obs) > 0:
+                circle_s = np.zeros((len(circle_obs),), dtype=np.float32)
+                for i, center in enumerate(circle_obs[:, :2]):
+                    idx = self._nearest_path_index(ref_path_f, center)
+                    circle_s[i] = ref_s[idx]
+            if segment_obs is not None and len(segment_obs) > 0:
+                s1 = np.zeros((len(segment_obs),), dtype=np.float32)
+                s2 = np.zeros((len(segment_obs),), dtype=np.float32)
+                for i, seg in enumerate(segment_obs):
+                    idx1 = self._nearest_path_index(ref_path_f, seg[:2])
+                    idx2 = self._nearest_path_index(ref_path_f, seg[2:4])
+                    s1[i] = ref_s[idx1]
+                    s2[i] = ref_s[idx2]
+                seg_s_min = np.minimum(s1, s2)
+                seg_s_max = np.maximum(s1, s2)
+
         for t in range(length):
+            # Select the k nearest *forward* obstacles w.r.t. the human progress along the
+            # reference path (instead of the robot), since the human is the one being guided.
+            s_human = None
+            if ref_path_f is not None and ref_s is not None and len(ref_path_f) > 0:
+                idx_h = self._nearest_path_index(ref_path_f, human[t])
+                s_human = float(ref_s[idx_h])
+
             offset = 0
             if self.n_obstacle_circles > 0:
                 if circle_obs is not None and len(circle_obs) > 0:
                     centers = circle_obs[:, :2]
                     radii = circle_obs[:, 2]
                     rel = centers - robot[t]
-                    dist_sq = np.sum(rel * rel, axis=1)
-                    order = np.argsort(dist_sq)
-                    count = min(self.n_obstacle_circles, len(order))
+                    if circle_s is not None and s_human is not None:
+                        delta_s = circle_s - float(s_human)
+                        candidates = np.nonzero(delta_s >= 0.0)[0]
+                        if len(candidates) > 0:
+                            order = candidates[np.argsort(delta_s[candidates])]
+                        else:
+                            order = np.zeros((0,), dtype=np.int64)
+                    else:
+                        # Fall back to proximity to the human when we cannot project
+                        # onto the reference path.
+                        d = centers - human[t]
+                        dist_sq = np.sum(d * d, axis=1)
+                        order = np.argsort(dist_sq)
+                    count = min(self.n_obstacle_circles, int(len(order)))
                     for i in range(self.n_obstacle_circles):
                         if i < count:
-                            rel_i = rel[order[i]]
+                            idx = int(order[i])
+                            rel_i = rel[idx]
                             if self.robot_frame:
                                 rel_i = self._rotate_rel(rel_i, headings[t])
                             feats[t, offset : offset + 2] = rel_i
                             if self.obstacle_include_radius:
-                                feats[t, offset + 2] = radii[order[i]]
+                                feats[t, offset + 2] = radii[idx]
+                            if self.obstacle_include_human_clearance:
+                                d = human[t] - centers[idx]
+                                dist = float(np.linalg.norm(d))
+                                clearance = dist - float(radii[idx] + self.human_radius)
+                                feats[t, circle_clear_offset + i] = float(clearance)
                         offset += circle_dim
                 else:
                     offset += self.n_obstacle_circles * circle_dim
 
             if self.n_obstacle_segments > 0:
                 if segment_obs is not None and len(segment_obs) > 0:
-                    dist_sq = np.zeros((len(segment_obs),), dtype=np.float32)
-                    for i, seg in enumerate(segment_obs):
-                        p1 = seg[:2]
-                        p2 = seg[2:4]
-                        dist_sq[i] = self._point_segment_dist_sq(robot[t], p1, p2)
-                    order = np.argsort(dist_sq)
-                    count = min(self.n_obstacle_segments, len(order))
+                    if (seg_s_min is not None) and (seg_s_max is not None) and (s_human is not None):
+                        valid = seg_s_max >= float(s_human)
+                        candidates = np.nonzero(valid)[0]
+                        if len(candidates) > 0:
+                            delta = np.maximum(0.0, seg_s_min - float(s_human))
+                            order = candidates[np.argsort(delta[candidates])]
+                        else:
+                            order = np.zeros((0,), dtype=np.int64)
+                    else:
+                        dist_sq = np.zeros((len(segment_obs),), dtype=np.float32)
+                        for i, seg in enumerate(segment_obs):
+                            p1 = seg[:2]
+                            p2 = seg[2:4]
+                            dist_sq[i] = self._point_segment_dist_sq(human[t], p1, p2)
+                        order = np.argsort(dist_sq)
+                    count = min(self.n_obstacle_segments, int(len(order)))
                     for i in range(self.n_obstacle_segments):
                         if i < count:
-                            seg = segment_obs[order[i]]
+                            seg = segment_obs[int(order[i])]
                             if self.segment_repr == "endpoints":
                                 p1 = seg[:2] - robot[t]
                                 p2 = seg[2:4] - robot[t]
@@ -429,11 +508,33 @@ class GuideLowdimDataset(BaseLowdimDataset):
                                     direction[0],
                                     direction[1],
                                 ]
+                            if self.obstacle_include_human_clearance:
+                                p1w = seg[:2].astype(np.float32)
+                                p2w = seg[2:4].astype(np.float32)
+                                dist_sq_h = self._point_segment_dist_sq(human[t], p1w, p2w)
+                                clearance = float(np.sqrt(dist_sq_h)) - float(self.human_radius)
+                                feats[t, seg_clear_offset + i] = float(clearance)
                         offset += 4
                 else:
                     offset += self.n_obstacle_segments * 4
 
         return feats
+
+    def _compute_path_s(self, path: np.ndarray) -> np.ndarray:
+        if path is None or len(path) == 0:
+            return np.zeros((0,), dtype=np.float32)
+        if len(path) == 1:
+            return np.zeros((1,), dtype=np.float32)
+        diffs = np.diff(path.astype(np.float32), axis=0)
+        seg_lengths = np.linalg.norm(diffs, axis=1).astype(np.float32)
+        s = np.zeros((len(path),), dtype=np.float32)
+        s[1:] = np.cumsum(seg_lengths, axis=0).astype(np.float32)
+        return s
+
+    def _nearest_path_index(self, path: np.ndarray, point: np.ndarray) -> int:
+        diffs = path - point.astype(np.float32)
+        dist_sq = np.sum(diffs * diffs, axis=1)
+        return int(np.argmin(dist_sq))
 
     def _rotate_rel(self, rel: np.ndarray, heading: float) -> np.ndarray:
         cos_h = float(np.cos(heading))

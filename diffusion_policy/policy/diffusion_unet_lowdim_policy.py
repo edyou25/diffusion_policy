@@ -28,6 +28,9 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             collision_loss_weight: float = 0.0,
             collision_loss_margin: float = 0.0,
             collision_loss_robot_radius: float = 0.3,
+            collision_loss_human_weight: float = 0.0,
+            collision_loss_human_radius: float = 0.3,
+            guide_leash_length: float = 1.5,
             guide_action_mode: str = "forward_heading",
             guide_n_lookahead: int = 0,
             guide_n_obstacle_circles: int = 0,
@@ -65,6 +68,9 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         self.collision_loss_weight = float(collision_loss_weight)
         self.collision_loss_margin = float(collision_loss_margin)
         self.collision_loss_robot_radius = float(collision_loss_robot_radius)
+        self.collision_loss_human_weight = float(collision_loss_human_weight)
+        self.collision_loss_human_radius = float(collision_loss_human_radius)
+        self.guide_leash_length = float(guide_leash_length)
         self.guide_action_mode = str(guide_action_mode).lower()
         self.guide_n_lookahead = int(guide_n_lookahead)
         self.guide_n_obstacle_circles = int(guide_n_obstacle_circles)
@@ -75,6 +81,7 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             raise ValueError(f"Unsupported guide_segment_repr: {self.guide_segment_repr}")
         self.last_base_loss = None
         self.last_collision_loss = None
+        self.last_human_collision_loss = None
         self.last_total_loss = None
 
         if num_inference_steps is None:
@@ -277,8 +284,9 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         base_loss = base_loss.mean()
 
         collision_loss = None
+        human_collision_loss = None
         if (
-            self.collision_loss_weight > 0
+            (self.collision_loss_weight > 0 or self.collision_loss_human_weight > 0)
             and self.guide_action_mode == "forward_heading"
             and self.obs_as_global_cond
             and ("obs" in batch)
@@ -356,71 +364,110 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
 
             margin = float(self.collision_loss_margin)
             robot_r = float(self.collision_loss_robot_radius)
+            human_r = float(self.collision_loss_human_radius)
 
-            per_sample_pen = torch.zeros((B,), device=action_slice.device, dtype=action_slice.dtype)
+            def compute_penalty(pos_seq: torch.Tensor, agent_r: float) -> torch.Tensor:
+                per_sample = torch.zeros(
+                    (B,), device=pos_seq.device, dtype=pos_seq.dtype
+                )
 
-            if circles is not None and circles.numel() > 0:
-                centers = circles[..., :2]
-                if self.guide_obstacle_include_radius:
-                    radii = circles[..., 2]
-                    valid = radii > 1e-6
-                else:
-                    radii = torch.zeros(
-                        (B, centers.shape[1]), device=centers.device, dtype=centers.dtype
-                    )
-                    valid = torch.linalg.norm(centers, dim=-1) > 1e-6
+                if circles is not None and circles.numel() > 0:
+                    centers = circles[..., :2]
+                    if self.guide_obstacle_include_radius:
+                        radii = circles[..., 2]
+                        valid = radii > 1e-6
+                    else:
+                        radii = torch.zeros(
+                            (B, centers.shape[1]), device=centers.device, dtype=centers.dtype
+                        )
+                        valid = torch.linalg.norm(centers, dim=-1) > 1e-6
 
-                diff = pos_pred[:, :, None, :] - centers[:, None, :, :]
-                dist = torch.linalg.norm(diff, dim=-1)
-                dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
-                clearance = dist - (radii[:, None, :] + robot_r)
-                circle_pen = torch.relu(margin - clearance) ** 2
-                per_sample_pen = per_sample_pen + circle_pen.min(dim=-1).values.mean(dim=-1)
-
-            if segments is not None and segments.numel() > 0:
-                if self.guide_segment_repr == "endpoints":
-                    p1 = segments[..., :2]
-                    p2 = segments[..., 2:4]
-                    ab = p2 - p1
-                    denom = (ab * ab).sum(dim=-1, keepdim=True)
-                    valid = denom.squeeze(-1) > 1e-8
-
-                    ap = pos_pred[:, :, None, :] - p1[:, None, :, :]
-                    t_proj = (ap * ab[:, None, :, :]).sum(dim=-1, keepdim=True) / torch.clamp(
-                        denom[:, None, :, :], min=1e-8
-                    )
-                    t_proj = torch.clamp(t_proj, 0.0, 1.0)
-                    closest = p1[:, None, :, :] + t_proj * ab[:, None, :, :]
-                    diff = pos_pred[:, :, None, :] - closest
+                    diff = pos_seq[:, :, None, :] - centers[:, None, :, :]
                     dist = torch.linalg.norm(diff, dim=-1)
                     dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
-                else:  # closest_dir, approximate walls as infinite lines
-                    c = segments[..., :2]
-                    d = segments[..., 2:4]
-                    d_norm = torch.linalg.norm(d, dim=-1, keepdim=True)
-                    valid = d_norm.squeeze(-1) > 1e-6
-                    d_unit = d / torch.clamp(d_norm, min=1e-6)
-                    delta = pos_pred[:, :, None, :] - c[:, None, :, :]
-                    cross = delta[..., 0] * d_unit[:, None, :, 1] - delta[..., 1] * d_unit[:, None, :, 0]
-                    dist = cross.abs()
-                    dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
+                    clearance = dist - (radii[:, None, :] + float(agent_r))
+                    circle_pen = torch.relu(margin - clearance) ** 2
+                    per_sample = per_sample + circle_pen.min(dim=-1).values.mean(dim=-1)
 
-                clearance = dist - robot_r
-                seg_pen = torch.relu(margin - clearance) ** 2
-                per_sample_pen = per_sample_pen + seg_pen.min(dim=-1).values.mean(dim=-1)
+                if segments is not None and segments.numel() > 0:
+                    if self.guide_segment_repr == "endpoints":
+                        p1 = segments[..., :2]
+                        p2 = segments[..., 2:4]
+                        ab = p2 - p1
+                        denom = (ab * ab).sum(dim=-1, keepdim=True)
+                        valid = denom.squeeze(-1) > 1e-8
+
+                        ap = pos_seq[:, :, None, :] - p1[:, None, :, :]
+                        t_proj = (ap * ab[:, None, :, :]).sum(dim=-1, keepdim=True) / torch.clamp(
+                            denom[:, None, :, :], min=1e-8
+                        )
+                        t_proj = torch.clamp(t_proj, 0.0, 1.0)
+                        closest = p1[:, None, :, :] + t_proj * ab[:, None, :, :]
+                        diff = pos_seq[:, :, None, :] - closest
+                        dist = torch.linalg.norm(diff, dim=-1)
+                        dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
+                    else:  # closest_dir, approximate walls as infinite lines
+                        c = segments[..., :2]
+                        d = segments[..., 2:4]
+                        d_norm = torch.linalg.norm(d, dim=-1, keepdim=True)
+                        valid = d_norm.squeeze(-1) > 1e-6
+                        d_unit = d / torch.clamp(d_norm, min=1e-6)
+                        delta = pos_seq[:, :, None, :] - c[:, None, :, :]
+                        cross = (
+                            delta[..., 0] * d_unit[:, None, :, 1]
+                            - delta[..., 1] * d_unit[:, None, :, 0]
+                        )
+                        dist = cross.abs()
+                        dist = torch.where(valid[:, None, :], dist, torch.full_like(dist, 1e6))
+
+                    clearance = dist - float(agent_r)
+                    seg_pen = torch.relu(margin - clearance) ** 2
+                    per_sample = per_sample + seg_pen.min(dim=-1).values.mean(dim=-1)
+
+                return per_sample
+
+            per_sample_pen = compute_penalty(pos_pred, robot_r)
+
+            per_sample_human_pen = None
+            if self.collision_loss_human_weight > 0:
+                # human initial position in robot-centric frame is part of obs: [robot_state(2), human_rel(2), ...]
+                human_pos = obs0[:, 2:4]
+                leash = float(self.guide_leash_length)
+                human_positions = []
+                for i in range(pos_pred.shape[1]):
+                    rpos = pos_pred[:, i]
+                    delta = human_pos - rpos
+                    dist = torch.linalg.norm(delta, dim=-1)
+                    dir_vec = delta / torch.clamp(dist.unsqueeze(-1), min=1e-6)
+                    projected = rpos + dir_vec * leash
+                    mask = dist > leash
+                    human_pos = torch.where(mask.unsqueeze(-1), projected, human_pos)
+                    human_positions.append(human_pos)
+                human_pred = (
+                    torch.stack(human_positions, dim=1) if human_positions else human_pos.unsqueeze(1)
+                )
+                per_sample_human_pen = compute_penalty(human_pred, human_r)
 
             # downweight collision penalty when the diffusion timestep is very noisy
             if pred_type == "epsilon":
                 w = alpha_bar.reshape(B)
             else:
                 w = torch.ones((B,), device=per_sample_pen.device, dtype=per_sample_pen.dtype)
-            collision_loss = (per_sample_pen * w).mean()
+            if self.collision_loss_weight > 0:
+                collision_loss = (per_sample_pen * w).mean()
+            if (per_sample_human_pen is not None) and (self.collision_loss_human_weight > 0):
+                human_collision_loss = (per_sample_human_pen * w).mean()
 
         total_loss = base_loss
         if collision_loss is not None:
             total_loss = total_loss + (self.collision_loss_weight * collision_loss)
+        if human_collision_loss is not None:
+            total_loss = total_loss + (self.collision_loss_human_weight * human_collision_loss)
 
         self.last_base_loss = base_loss.detach()
         self.last_collision_loss = None if collision_loss is None else collision_loss.detach()
+        self.last_human_collision_loss = (
+            None if human_collision_loss is None else human_collision_loss.detach()
+        )
         self.last_total_loss = total_loss.detach()
         return total_loss

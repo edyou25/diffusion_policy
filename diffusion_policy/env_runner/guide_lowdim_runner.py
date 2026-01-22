@@ -44,6 +44,9 @@ class GuideLowdimRunner(BaseLowdimRunner):
         n_obstacle_circles: int = 0,
         n_obstacle_segments: int = 0,
         obstacle_include_radius: bool = True,
+        obstacle_include_human_clearance: bool = False,
+        human_radius: float = 0.3,
+        segment_repr: str = "endpoints",
         tqdm_interval_sec: float = 5.0,
         **kwargs
     ):
@@ -83,6 +86,9 @@ class GuideLowdimRunner(BaseLowdimRunner):
             n_obstacle_circles=n_obstacle_circles,
             n_obstacle_segments=n_obstacle_segments,
             obstacle_include_radius=obstacle_include_radius,
+            obstacle_include_human_clearance=obstacle_include_human_clearance,
+            human_radius=human_radius,
+            segment_repr=segment_repr,
         )
         
         # Get validation episodes from replay buffer
