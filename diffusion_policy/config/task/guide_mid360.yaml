@@ -1,0 +1,62 @@
+name: guide_mid360
+
+n_lookahead: 10
+k_lookahead: 5
+frame_stride: 5
+lidar_num_bins: 128
+obs_dim: ${eval:'4 + 2*${task.n_lookahead} + ${task.lidar_num_bins}'}  # robot(2) + human(2) + lookahead + lidar scan
+action_dim: 2
+keypoint_dim: 0
+
+dataset:
+  _target_: diffusion_policy.dataset.guide_mid360_dataset.GuideMid360Dataset
+  data_dir: /home/yyf/IROS2026/FollowDataset/data
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  action_mode: forward_heading
+  frame_stride: ${task.frame_stride}
+  n_lookahead: ${task.n_lookahead}
+  k_lookahead: ${task.k_lookahead}
+  robot_frame: true
+  robot_state: vel
+  turn_speed: 1.5
+  lidar_num_bins: ${task.lidar_num_bins}
+  lidar_min_angle: -3.141592653589793
+  lidar_max_angle: 3.141592653589793
+  lidar_min_range: 0.2
+  lidar_max_range: 8.0
+  lidar_ground_height: 0.1
+  lidar_max_height: 2.2
+  lidar_use_world_height: true
+  lidar_cache: true
+
+env_runner:
+  _target_: diffusion_policy.env_runner.guide_mid360_runner.GuideMid360Runner
+  data_dir: ${task.dataset.data_dir}
+  n_test: 50
+  n_test_vis: 4
+  test_start_seed: 100000
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  val_ratio: ${task.dataset.val_ratio}
+  action_mode: ${task.dataset.action_mode}
+  frame_stride: ${task.frame_stride}
+  n_lookahead: ${task.n_lookahead}
+  k_lookahead: ${task.k_lookahead}
+  robot_frame: ${task.dataset.robot_frame}
+  lidar_num_bins: ${task.lidar_num_bins}
+  lidar_min_angle: ${task.dataset.lidar_min_angle}
+  lidar_max_angle: ${task.dataset.lidar_max_angle}
+  lidar_min_range: ${task.dataset.lidar_min_range}
+  lidar_max_range: ${task.dataset.lidar_max_range}
+  lidar_ground_height: ${task.dataset.lidar_ground_height}
+  lidar_max_height: ${task.dataset.lidar_max_height}
+  lidar_use_world_height: ${task.dataset.lidar_use_world_height}
+  tqdm_interval_sec: 5.0
